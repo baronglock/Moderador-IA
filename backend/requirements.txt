@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+openai-whisper
+yt-dlp
+opencv-python
+ultralytics
+easyocr
+langchain
+langchain-huggingface
+langchain-community
+ollama
+faiss-cpu
+panns-inference
+torchlibrosa
+soundfile
+nudenet
