@@ -101,7 +101,7 @@ def inspecao_visual_avancada_vlm(lista_de_frames):
     flags_visuais = []
     descricao_geral = "N/A"
     try:
-        res_desc = ollama.chat(model='llava', messages=[{'role': 'user', 'content': 'Descreva a ação principal nesta imagem em uma frase curta.', 'images': [frame_central]}])
+        res_desc = ollama.chat(model='qwen2:7b', messages=[{'role': 'user', 'content': 'Descreva a ação principal nesta imagem em uma frase curta.', 'images': [frame_central]}])
         descricao_geral = res_desc['message']['content']
         # Adicione aqui outras perguntas específicas se necessário (gestos, símbolos, etc.)
     except Exception as e:
