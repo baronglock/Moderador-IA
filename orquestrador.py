@@ -1,23 +1,43 @@
-# Arquivo: orquestrador.py (Rode este script no seu PC local)
 import os
 import requests
 import time
 import subprocess
 
 # --- CONFIGURAÇÕES ---
-# Cole aqui suas credenciais. NUNCA compartilhe sua chave de API!
-RUNPOD_API_KEY = "rpa_MCUX6CIO4U04TP2HIIH6V1ILVLR4275ZP92KM5MGo42u7j"
-POD_ID = "juwa7acfrg21y3" # ex: 'jwsctharf1qg2y'
+API_KEY = "rpa_MCUX6CIO4U04TP2HIIH6V1ILVLR4275ZP92KM5MGo42u7j"
+POD_ID = "rhr2d843z3ju3r"
 
-# --- FUNÇÕES DA API DO RUNPOD ---
+# --- FUNÇÕES DA API DO RUNPOD (GraphQL) ---
 
-def controlar_pod(acao: str):
-    """Envia um comando para a API do RunPod para 'start' ou 'stop'."""
-    endpoint = f"https://api.runpod.io/v2/{POD_ID}/{'resume' if acao == 'start' else 'stop'}"
-    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
+def controlar_pod_graphql(acao: str):
+    """Envia um comando para a API do RunPod usando GraphQL."""
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    
+    if acao == 'start':
+        mutation = f"""
+        mutation {{
+          podResume(input: {{ podId: "{POD_ID}" }}) {{
+            id
+            desiredStatus
+          }}
+        }}
+        """
+    else:  # stop
+        mutation = f"""
+        mutation {{
+          podStop(input: {{ podId: "{POD_ID}" }}) {{
+            id
+            desiredStatus
+          }}
+        }}
+        """
     
     print(f"Enviando comando '{acao}' para o Pod {POD_ID}...")
-    response = requests.post(endpoint, headers=headers)
+    response = requests.post(
+        "https://api.runpod.io/graphql",
+        json={"query": mutation},
+        headers=headers
+    )
     
     if response.status_code == 200:
         print(f"Comando '{acao}' enviado com sucesso.")
@@ -26,57 +46,76 @@ def controlar_pod(acao: str):
         print(f"Erro ao enviar comando '{acao}': {response.status_code} - {response.text}")
         return None
 
-def esperar_pod_ficar_pronto():
-    """Verifica o status do Pod até que ele esteja 'RUNNING'."""
-    endpoint = f"https://api.runpod.io/v2/{POD_ID}"
-    headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}"}
+def verificar_status_pod_graphql():
+    """Verifica o status do Pod usando GraphQL."""
+    headers = {"Authorization": f"Bearer {API_KEY}"}
     
-    print("Aguardando o Pod ficar 100% pronto (pode levar alguns minutos)...")
-    while True:
-        try:
-            response = requests.get(endpoint, headers=headers)
-            if response.status_code == 200:
-                status = response.json().get('desiredStatus')
-                print(f"Status atual do Pod: {status}")
-                if status == 'RUNNING':
-                    print("Pod está 'RUNNING' e pronto para receber conexões!")
-                    # Espera extra para garantir que os serviços internos subam
-                    time.sleep(30) 
-                    break
-            else:
-                print(f"Aguardando... status code: {response.status_code}")
-            
-            time.sleep(15) # Espera 15 segundos entre cada verificação
-        except Exception as e:
-            print(f"Erro ao verificar status: {e}")
-            time.sleep(15)
+    query = f"""
+    {{
+      pod(input: {{ podId: "{POD_ID}" }}) {{
+        id
+        desiredStatus
+        runtime {{
+          uptimeSeconds
+          publicIp
+          ports {{
+            privatePort
+            publicPort
+          }}
+        }}
+      }}
+    }}
+    """
+    
+    response = requests.post(
+        "https://api.runpod.io/graphql",
+        json={"query": query},
+        headers=headers
+    )
+    
+    if response.status_code == 200:
+        data = response.json()
+        pod = data.get('data', {}).get('pod')
+        if pod:
+            return pod.get('desiredStatus')
+    return None
 
-# --- FLUXO PRINCIPAL DO ORQUESTRADOR ---
+# --- FLUXO PRINCIPAL ---
 
 if __name__ == "__main__":
     try:
-        # 1. Ligar o Pod
-        controlar_pod('start')
+        # 1. Verificar status atual
+        status = verificar_status_pod_graphql()
+        print(f"Status atual do pod: {status}")
         
-        # 2. Esperar ele ficar pronto
-        esperar_pod_ficar_pronto()
+        if status != "RUNNING":
+            # 2. Ligar o Pod se não estiver rodando
+            controlar_pod_graphql('start')
+            
+            # 3. Esperar ficar pronto
+            print("Aguardando o Pod ficar pronto...")
+            while True:
+                status = verificar_status_pod_graphql()
+                if status == "RUNNING":
+                    print("Pod está RUNNING!")
+                    time.sleep(30)  # Espera extra
+                    break
+                time.sleep(15)
         
-        # 3. Iniciar o servidor FastAPI no Pod (Lembre-se de fazer isso manualmente por enquanto)
+        # 4. Instruções para conectar
         print("\n--- AÇÃO NECESSÁRIA ---")
-        print("O Pod está no ar. Por favor, conecte-se a ele via SSH/Terminal e inicie o servidor com:")
-        print("source venv/bin/activate && uvicorn backend.main:app --host 0.0.0.0 --port 8000")
-        input("Pressione Enter aqui quando o servidor estiver rodando no Pod...")
+        print("Conecte ao pod usando:")
+        print("ssh root@47.47.180.59 -p 21726 -i /storage/moderador-IA/Moderador-IA")
+        print("\nDepois inicie o servidor com:")
+        print("cd /workspace/Moderador-IA && source /workspace/venv/bin/activate && uvicorn backend.main:app --host 0.0.0.0 --port 8000")
+        input("\nPressione Enter quando o servidor estiver rodando...")
         
-        # 4. Rodar o robô Playwright localmente
-        print("\nIniciando o robô Playwright no seu PC...")
-        # Garante que estamos no diretório certo para o Playwright
+        # 5. Rodar o Playwright
+        print("\nIniciando o robô Playwright...")
         caminho_automacao = os.path.join(os.path.dirname(__file__), 'automacao')
         subprocess.run(["npx", "playwright", "test", "--headed"], cwd=caminho_automacao, check=True)
-        print("Robô Playwright finalizou o trabalho.")
-
+        
     except Exception as e:
-        print(f"Ocorreu um erro no orquestrador: {e}")
+        print(f"Erro: {e}")
     finally:
-        # 5. Desligar o Pod, não importa o que aconteça
-        print("\nFinalizando a sessão...")
-        controlar_pod('stop')
+        print("\nTrabalho concluído!")

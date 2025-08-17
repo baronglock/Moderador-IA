@@ -9,8 +9,9 @@ langchain
 langchain-huggingface
 langchain-community
 ollama
-faiss-cpu
+faiss-gpu
 panns-inference
 torchlibrosa
 soundfile
-nudenet
+NudeNetClassifier
+deepface

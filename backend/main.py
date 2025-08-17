@@ -1,244 +1,251 @@
-# Arquivo: backend/main.py (Versão Final e Completa para Servidor com GPU)
+# Arquivo: backend/main.py (Versão 5.1 - Foco em Ações, Análise com 5 Frames)
 import os
 import json
-import whisper
 import uvicorn
 from fastapi import FastAPI
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import cv2
-from ultralytics import YOLO
-import easyocr
-from operator import itemgetter
 import ollama
 import numpy as np
-import soundfile as sf
-import librosa
+import whisper
+from contextlib import asynccontextmanager
+import asyncio
+import torch
 
-# Importações para Análise de Som e Nudez
-from panns_inference import AudioTagging
+# REMOVEMOS: from ultralytics import YOLO (não vamos mais usar)
 from nudenet import NudeClassifier
-
-# Importações do Langchain
-from langchain_community.document_loaders import TextLoader
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import CharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
+import easyocr
 
-# --- Constantes ---
+# --- CONSTANTES ---
 POLITICAS_PATH = os.path.join("backend", "politicas", "politicas.md")
 VECTORSTORE_PATH = os.path.join("backend", "faiss_index")
+MODELS = {}
 
-# --- FUNÇÕES DE ANÁLISE DE ALTA PRECISÃO ---
+# --- FUNÇÕES DE ANÁLISE (ESTRATÉGIA FINAL) ---
 
-def extrair_frames(video_path, num_frames=5):
-    print(f"Extraindo até {num_frames} frames do vídeo...")
+def extrair_frames_chave(video_path, num_frames_chave=5): # AUMENTADO PARA 5 FRAMES
+    """
+    Extrai um número definido de frames chave (default: 5), bem distribuídos.
+    """
+    print(f"Extraindo {num_frames_chave} frames chave...")
     if not os.path.exists(video_path): return []
+    
     cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames < 1: return []
-    intervalo = total_frames // num_frames if num_frames > 0 and total_frames > num_frames else 1
-    caminhos_frames = []
+    total_frames_video = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames_video < num_frames_chave:
+        cap.release()
+        return []
+
+    indices = np.linspace(0, total_frames_video - 1, num_frames_chave, dtype=int)
+    
+    caminhos_dos_frames = []
     pasta_temp = os.path.join("backend", "temp_frames")
     os.makedirs(pasta_temp, exist_ok=True)
-    for i in range(num_frames):
-        frame_id = i * intervalo
+    
+    for i, frame_id in enumerate(indices):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
         ret, frame = cap.read()
-        if not ret: continue
-        frame_path = os.path.join(pasta_temp, f"frame_{i}.jpg")
-        cv2.imwrite(frame_path, frame)
-        caminhos_frames.append(frame_path)
+        if ret:
+            frame_path = os.path.join(pasta_temp, f"{os.path.basename(video_path).replace('.', '_')}_frame_{i}.jpg")
+            cv2.imwrite(frame_path, frame)
+            caminhos_dos_frames.append(frame_path)
+            
     cap.release()
-    print(f"{len(caminhos_frames)} frames extraídos com sucesso.")
-    return caminhos_frames
+    print(f"{len(caminhos_dos_frames)} frames chave extraídos.")
+    return caminhos_dos_frames
 
-def analisar_frames_objetos_preciso(lista_de_frames):
-    print("Analisando frames com YOLOv8-Large...")
-    model = YOLO('yolov8l.pt')
-    objetos_detectados = set()
-    for frame_path in lista_de_frames:
-        results = model(frame_path, verbose=False)
-        for result in results:
-            for box in result.boxes:
-                if box.conf[0] > 0.4:
-                    nome_objeto = result.names[int(box.cls[0])]
-                    objetos_detectados.add(nome_objeto)
-    print("Objetos detectados (alta precisão):", list(objetos_detectados))
-    return list(objetos_detectados)
+def analise_visual_direta(lista_de_frames):
+    """
+    Descreve cada frame chave individualmente para o 'Juiz' analisar.
+    """
+    print("Iniciando análise visual direta com LLaVA...")
+    if not lista_de_frames:
+        return {"descricao_geral": "Nenhum frame extraído para análise."}
+    
+    descricoes_individuais = []
+    prompt_individual = """
+    Você é um sistema de moderação. Descreva esta imagem de forma clínica e anônima.
+    Foque APENAS em:
+    - Ações (dançando, brigando, etc.)
+    - Roupas e nudez (explícita ou sugestiva)
+    - Faixa etária estimada (criança, adolescente, adulto).
+    - Qualquer detalhe que possa violar uma política de segurança.
+    """
 
-def analisar_frames_ocr(lista_de_frames):
-    print("Analisando frames com EasyOCR (GPU)...")
-    reader = easyocr.Reader(['pt', 'en'], gpu=True)
+    # CORREÇÃO DO BUG: Usando 'lista_de_frames' em vez de 'frames_chave'
+    for i, frame_path in enumerate(lista_de_frames):
+        try:
+            res = ollama.generate(model='llava:latest', prompt=prompt_individual, images=[frame_path], stream=False)
+            descricoes_individuais.append(f"Análise da Cena {i+1}: {res['response']}")
+        except Exception as e:
+            descricoes_individuais.append(f"Cena {i+1}: Erro - {e}")
+    
+    descricao_final = "\n".join(descricoes_individuais)
+    print(f"Descrição visual final: {descricao_final[:300]}...")
+    return {"descricao_geral": descricao_final}
+
+def analisar_video_localmente(caminho_do_video, models):
+    print(f"\n--- Analisando vídeo: {os.path.basename(caminho_do_video)} ---")
+    
+    frames = extrair_frames_chave(caminho_do_video) # Usa a extração de 5 frames
+    
+    analise_visual = analise_visual_direta(frames) # Analisa os 5 frames
+    
+    textos = leitura_de_texto_easyocr(frames, models['easyocr'])
+    score_nudez = deteccao_nudez_nudenet(frames, models['nudenet'])
+    transcricao = transcricao_de_audio_whisper(caminho_do_video, models['whisper'])
+    eh_menor, resumo_facial = analise_facial_deepface(frames)
+    
+    dossie = {
+        "nome_do_arquivo": os.path.basename(caminho_do_video),
+        # REMOVEMOS: a detecção de objetos
+        "textos_na_tela": textos,
+        "descricao_visual_cenas": analise_visual.get("descricao_geral", ""),
+        "score_nudez": score_nudez,
+        "transcricao_audio": transcricao,
+        "eh_menor_detectado_deepface": eh_menor,
+        "resumo_facial_deepface": resumo_facial,
+    }
+    
+    print(f"DOSSIÊ COMPLETO: {json.dumps(dossie, indent=2, ensure_ascii=False)}")
+    
+    resultado_final = julgamento_final_com_rag(dossie, models['retriever'])
+    
+    for frame in frames:
+        if os.path.exists(frame):
+            os.remove(frame)
+            
+    return resultado_final
+
+def inicializar_modelos():
+    """Carrega todos os modelos, forçando o uso de GPU."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"--- DETECTADO DISPOSITIVO: {device.upper()} ---")
+    
+    print("--- CARREGANDO MODELOS ---")
+    
+    MODELS['whisper'] = whisper.load_model("medium", device=device)
+    MODELS['easyocr'] = easyocr.Reader(['pt', 'en'], gpu=(device=="cuda"))
+    MODELS['nudenet'] = NudeClassifier()
+    # REMOVEMOS: MODELS['yolo'] = YOLO('yolov8l.pt')
+    
+    MODELS['embeddings'] = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={'device': device})
+    
+    if not os.path.exists(VECTORSTORE_PATH):
+        raise FileNotFoundError(f"Vectorstore não encontrado em {VECTORSTORE_PATH}.")
+    
+    MODELS['vectorstore'] = FAISS.load_local(VECTORSTORE_PATH, MODELS['embeddings'], allow_dangerous_deserialization=True)
+    MODELS['retriever'] = MODELS['vectorstore'].as_retriever(search_kwargs={"k": 7})
+
+    print("--- MODELOS DE BASE CARREGADOS. ---")
+
+# --- O RESTANTE DO CÓDIGO (LIFESPAN, JULGAMENTO, ETC) ---
+# ... (Cole aqui o resto do seu código da versão 5.0, que já está correto)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Lifespan: Agendando a inicialização dos modelos...")
+    await asyncio.to_thread(inicializar_modelos)
+    print("Lifespan: Modelos inicializados, aplicação pronta.")
+    yield
+    print("Lifespan: Evento de finalização...")
+    MODELS.clear()
+
+app = FastAPI(lifespan=lifespan)
+
+# (Funções de análise individuais que não mudaram)
+def leitura_de_texto_easyocr(lista_de_frames, reader_easyocr):
+    print("Analisando frames com EasyOCR...")
     textos_encontrados = set()
     for frame_path in lista_de_frames:
-        results = reader.readtext(frame_path)
-        for (bbox, text, prob) in results:
-            if prob > 0.5:
+        results = reader_easyocr.readtext(frame_path)
+        for (_, text, prob) in results:
+            if prob > 0.4:
                 textos_encontrados.add(text)
     texto_final = " ".join(textos_encontrados)
-    print("Texto encontrado na tela:", texto_final)
+    print(f"Texto na tela: '{texto_final}'")
     return texto_final
 
-def analisar_frames_nudez(lista_de_frames):
-    print("Analisando frames com NudeNet para detecção de nudez...")
-    classifier = NudeClassifier()
+def deteccao_nudez_nudenet(lista_de_frames, classifier_nudenet):
+    print("Analisando frames com NudeNet...")
+    if not lista_de_frames: return 0.0
     maior_pontuacao_unsafe = 0.0
-    results = classifier.classify(lista_de_frames)
-    for frame_path, result_dict in results.items():
+    results = classifier_nudenet.classify(lista_de_frames)
+    for _, result_dict in results.items():
         pontuacao_unsafe = result_dict.get('unsafe', 0.0)
         if pontuacao_unsafe > maior_pontuacao_unsafe:
             maior_pontuacao_unsafe = pontuacao_unsafe
-    print(f"Maior pontuação de nudez (unsafe) encontrada: {maior_pontuacao_unsafe:.2f}")
+    print(f"Maior pontuação de nudez: {maior_pontuacao_unsafe:.2f}")
     return maior_pontuacao_unsafe
 
-def inspecao_visual_avancada_vlm(lista_de_frames):
-    print("Iniciando inspeção visual avançada com LLaVA...")
-    if not lista_de_frames: return {"flags_visuais": [], "descricao_geral": "Nenhuma imagem para descrever."}
-    frame_central = lista_de_frames[len(lista_de_frames) // 2]
-    flags_visuais = []
-    descricao_geral = "N/A"
+def analise_facial_deepface(lista_de_frames):
+    print("Analisando faces com DeepFace...")
     try:
-        res_desc = ollama.chat(model='qwen2:7b', messages=[{'role': 'user', 'content': 'Descreva a ação principal nesta imagem em uma frase curta.', 'images': [frame_central]}])
-        descricao_geral = res_desc['message']['content']
-        # Adicione aqui outras perguntas específicas se necessário (gestos, símbolos, etc.)
+        from deepface import DeepFace
+    except ImportError:
+        return False, "DeepFace não instalado."
+    resumos_faciais = []
+    idade_minima = 99
+    for frame in lista_de_frames[:10]:
+        try:
+            resultados = DeepFace.analyze(img_path=frame, actions=['age'], enforce_detection=False)
+            for rosto in resultados:
+                idade = rosto['age']
+                resumos_faciais.append(f"Rosto (idade ~{idade})")
+                if idade < idade_minima:
+                    idade_minima = idade
+        except:
+            pass
+    if not resumos_faciais:
+        return False, "Nenhum rosto detectado."
+    resumo_final = f"Idade mínima ~{idade_minima}. Detalhes: " + " | ".join(list(set(resumos_faciais)))
+    print(f"Resumo da Análise Facial: {resumo_final}")
+    return idade_minima < 18, resumo_final
+
+def transcricao_de_audio_whisper(video_path, model_whisper):
+    print("Transcrevendo áudio com Whisper...")
+    try:
+        transcricao = model_whisper.transcribe(video_path, fp16=True)["text"]
+        print(f"Transcrição: '{transcricao}'")
+        return transcricao.strip()
     except Exception as e:
-        descricao_geral = f"Erro na descrição VLM: {e}"
-    print(f"Inspeção VLM concluída. Descrição: '{descricao_geral}'. Flags: {flags_visuais}")
-    return {"flags_visuais": flags_visuais, "descricao_geral": descricao_geral}
+        print(f"Erro na transcrição: {e}")
+        return ""
 
-def analisar_eventos_de_som(audio_path):
-    print("Analisando eventos de som com PANNs...")
+def julgamento_final_com_rag(dossie_completo, retriever):
+    print("Iniciando julgamento final com RAG...")
+    query_para_retriever = f"""- Descrições das Cenas do Vídeo: {dossie_completo.get('descricao_visual_cenas')}\n- Análise facial (DeepFace): {dossie_completo.get('resumo_facial_deepface')}\n- Transcrição do áudio: {dossie_completo.get('transcricao_audio')}\n- Texto na tela: {dossie_completo.get('textos_na_tela')}"""
+    docs = retriever.get_relevant_documents(query_para_retriever)
+    politicas_relevantes = "\n\n---\n\n".join([doc.page_content for doc in docs])
+    prompt_final = f"""Você é um juiz de moderação. Analise as 'EVIDÊNCIAS DO VÍDEO' e determine se alguma das 'POLÍTICAS' foi violada. A 'Descrição das Cenas' é sua principal fonte de verdade. Se a descrição mencionar 'menor', 'adolescente', 'criança', ou indicativo de juventude, considere como presença de menor, mesmo que a 'Análise facial' diga o contrário. Sua resposta deve ser **APENAS UM OBJETO JSON**. Formato Violação: {{"policy_name": "Nome", "policy_priority": 0, "reason": "Justificativa."}}. Formato Allow: {{"policy_name": "Allow", "policy_priority": 99, "reason": "Nenhuma violação."}}"""
     try:
-        at = AudioTagging(checkpoint_path=None, device='cuda') 
-        audio, _ = librosa.core.load(audio_path, sr=32000, mono=True)
-        audio = audio[None, :]
-        _, embedding = at.inference(audio)
-        framewise_output = embedding['framewise_output']
-        sorted_indexes = np.argsort(np.max(framewise_output, axis=0))[::-1]
-        eventos = [at.labels[sorted_indexes[i]] for i in range(5)]
-        print("Eventos de som detectados:", eventos)
-        return eventos
-    except Exception as e:
-        print(f"Erro na análise de som: {e}")
-        return ["N/A"]
-
-# --- Funções do Motor RAG ---
-
-def carregar_e_criar_vetores():
-    loader = TextLoader(POLITICAS_PATH)
-    documents = loader.load()
-    text_splitter = CharacterTextSplitter(chunk_size=1500, chunk_overlap=100)
-    docs = text_splitter.split_documents(documents)
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    db = FAISS.from_documents(docs, embeddings)
-    db.save_local(VECTORSTORE_PATH)
-    return db
-
-def get_chain():
-    if not os.path.exists(VECTORSTORE_PATH):
-        vectorstore = carregar_e_criar_vetores()
-    else:
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        vectorstore = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
-
-    retriever = vectorstore.as_retriever()
-    template = """
-    Você é um moderador de conteúdo de IA. Sua tarefa é analisar um dossiê completo de dados de um vídeo e identificar a violação mais grave com base ESTRITAMENTE nas políticas fornecidas.
-    As políticas são hierárquicas por Prioridade (P0 > P1 > P2...).
-
-    POLÍTICAS DE MODERAÇÃO RELEVANTES:
-    {context}
-
-    DADOS EXTRAÍDOS DO VÍDEO (Dossiê):
-    {input_data}
-
-    SIGA ESTES PASSOS DE RACIOCÍNIO:
-    1.  **Análise de Contexto:** Analise a combinação de todos os dados do dossiê para entender o que está acontecendo no vídeo.
-    2.  **Identificação de Violações:** Com base no contexto, liste TODAS as políticas-mãe (ex: 'Safety Recheck') que foram violadas.
-    3.  **Seleção por Prioridade:** Se múltiplas políticas forem violadas, escolha a que tiver a MAIOR prioridade (P0 vence P1, etc.).
-
-    FORNEÇA A SAÍDA APENAS EM FORMATO JSON VÁLIDO, contendo a `policy_name`, a `policy_priority`, e uma `reason`.
-
-    JSON de Saída:
-    """
-    prompt = PromptTemplate.from_template(template)
-    llm = ollama.Client()
-
-    chain = (
-        {
-            "context": itemgetter("combined_input") | retriever,
-            "input_data": itemgetter("combined_input"),
-        }
-        | prompt
-        | (lambda x: llm.chat(model='llama3:8b', messages=[{'role': 'user', 'content': x.text}])['message']['content'])
-        | StrOutputParser()
-    )
-    return chain
-
-# --- FUNÇÃO PRINCIPAL DE ANÁLISE (COMPLETA) ---
-def analisar_video_localmente(video_path: str):
-    if not os.path.exists(video_path):
-        return {"erro": "Arquivo de vídeo não encontrado!"}
-
-    # Análise Visual Completa
-    frames = extrair_frames(video_path)
-    objetos_detectados = analisar_frames_objetos_preciso(frames)
-    texto_na_tela = analisar_frames_ocr(frames)
-    inspecao_vlm = inspecao_visual_avancada_vlm(frames)
-    pontuacao_nudez = analisar_frames_nudez(frames)
-    
-    # Análise de Áudio Completa
-    print("Carregando modelo Whisper (Medium)...")
-    model_whisper = whisper.load_model("medium")
-    transcricao_texto = model_whisper.transcribe(video_path, fp16=True)["text"]
-    print("Transcrição concluída:", transcricao_texto)
-    eventos_de_som = analisar_eventos_de_som(video_path)
-
-    # Monta o dossiê final completo em formato de string
-    dossie_completo_str = f"""
-    - Transcrição do Áudio: "{transcricao_texto if transcricao_texto.strip() else 'Áudio vazio.'}"
-    - Eventos de Som Detectados: {eventos_de_som}
-    - Objetos Visuais Detectados: {objetos_detectados}
-    - Texto na Tela (OCR): "{texto_na_tela if texto_na_tela.strip() else 'Nenhum texto encontrado.'}"
-    - Descrição da Ação (IA Visual): "{inspecao_vlm['descricao_geral']}"
-    - Flags Visuais de Alerta (IA Visual): {inspecao_vlm['flags_visuais']}
-    - Pontuação de Nudez (0.0 a 1.0): {pontuacao_nudez:.2f}
-    """
-    print("\n--- DOSSIÊ COMPLETO ENVIADO PARA JULGAMENTO ---")
-    print(dossie_completo_str)
-    print("---------------------------------------------\n")
-
-    # Inicia o julgamento final com o motor RAG
-    print("Iniciando julgamento final com o motor RAG...")
-    chain = get_chain()
-    resultado_rag_str = chain.invoke({"combined_input": dossie_completo_str})
-    
-    # Tenta extrair o JSON da resposta do LLM
-    try:
-        json_start = resultado_rag_str.find('{')
-        json_end = resultado_rag_str.rfind('}') + 1
-        if json_start != -1 and json_end != 0:
-            json_str = resultado_rag_str[json_start:json_end]
-            return json.loads(json_str)
+        response = ollama.generate(model='qwen2:7b', prompt=prompt_final, format='json', stream=False, options={"temperature": 0.0})
+        response_text = response['response']
+        json_start = response_text.find('{')
+        json_end = response_text.rfind('}') + 1
+        if json_start != -1 and json_end != -1:
+            json_str = response_text[json_start:json_end]
+            resultado_json = json.loads(json_str)
         else:
-            raise json.JSONDecodeError("JSON não encontrado", resultado_rag_str, 0)
-    except json.JSONDecodeError:
-        return {"erro": "Saída inválida do LLM", "output_text": resultado_rag_str}
+            raise ValueError("Nenhum JSON encontrado na resposta")
+        print(f"Decisão da IA: {resultado_json}")
+        return resultado_json
+    except Exception as e:
+        print(f"ERRO CRÍTICO no julgamento do LLM: {e}")
+        return {"policy_name": "Analysis Failed", "policy_priority": -1, "reason": str(e)}
 
-# --- Configuração do App FastAPI ---
-app = FastAPI()
 class VideoRequest(BaseModel):
-    video_url: str # Mudado de HttpUrl para str para mais flexibilidade
+    caminho_do_video: str
+
 @app.post("/analisar_video/")
 async def analisar_video_endpoint(request: VideoRequest):
-    # No futuro, esta função fará o download do vídeo da URL e chamará a análise.
-    print(f"Recebida requisição para analisar a URL: {request.video_url}")
-    # A implementação real do download e chamada da análise iria aqui.
-    return {"status": "Endpoint online, pronto para implementação."}
+    if not MODELS:
+        print("AVISO: Modelos não estavam inicializados. Carregando sob demanda.")
+        inicializar_modelos()
+    resultado = analisar_video_localmente(request.caminho_do_video, MODELS)
+    return resultado
 
 if __name__ == "__main__":
-    # Esta parte só é usada para rodar o servidor, não afeta o testador_local.py
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    print("Iniciando o servidor de análise...")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
